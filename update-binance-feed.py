@@ -26,7 +26,13 @@ import urllib.request
 from datetime import datetime, timezone
 
 # Failover order. All three serve identical public market data.
-HOSTS = ["api.binance.com", "api-gcp.binance.com", "data-api.binance.vision"]
+#
+# data-api.binance.vision is deliberately first: Binance geo-blocks the main
+# api.binance.com and api-gcp.binance.com endpoints from US datacenter ranges
+# (HTTP 451), which is where GitHub Actions runners live. The .vision host is
+# Binance's public market-data mirror and answers from everywhere. The other
+# two stay as fallbacks because they do work from other networks.
+HOSTS = ["data-api.binance.vision", "api.binance.com", "api-gcp.binance.com"]
 
 # (binance symbol, display symbol, display name) in portfolio display order.
 COINS = [
