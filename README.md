@@ -23,6 +23,25 @@ creative fetches at render time.
   `Content-Encoding: gzip`, `Cache-Control: max-age=60`.
 - **Schedule:** hourly (`0 * * * *`), plus manual `workflow_dispatch`.
 
+## Snapshot archive
+
+After each successful publish the job also writes the same document to
+`s3://gp-creatives/binance/history/prices-{YYYYMMDDHH}.json` and rebuilds
+`history/index.json` with the newest 5 stamps. The portfolio's time-machine
+control reads that index.
+
+Snapshots are immutable and never deleted - a year of hourly runs is ~3.4MB,
+which is a better trade than giving a scheduled job a delete path into a bucket
+that also holds live creatives. Only the index rolls.
+
+The index is built from a real S3 listing, not by computing the last N
+hour-stamps. Runs do get skipped (GitHub drops scheduled jobs under load, and a
+validation failure publishes nothing), so computed stamps would point at 404s
+and the portfolio would render blank phones.
+
+Archiving is secondary: if it fails, a warning is logged and the run still exits
+0, because the live feed is what matters. Skip it with `--no-archive`.
+
 ### Safety
 
 The S3 object is read by a live serving creative, so the job refuses to publish

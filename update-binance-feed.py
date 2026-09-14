@@ -12,7 +12,8 @@ prices rather than zeros or a broken payload.
 
 Usage:
   ./update-binance-feed.py            # fetch, validate, upload
-  ./update-binance-feed.py --dry-run  # fetch, validate, print. No upload.
+  ./update-binance-feed.py --dry-run     # fetch, validate, print. No upload.
+  ./update-binance-feed.py --no-archive  # publish the feed but skip history/
 """
 
 import gzip
@@ -67,6 +68,9 @@ CMC_KEY_FILE = os.path.expanduser("~/.cmc_key")
 SMADEX_URL = "https://static-content-1.smadex.com/cr84es/templ8s/xCrypto"
 
 S3_KEY = os.environ.get("FEED_S3_KEY", "s3://gp-creatives/binance/binance-prices.json")
+# Rolling snapshot archive powering the portfolio time-machine control.
+HISTORY_PREFIX = os.environ.get("FEED_HISTORY_PREFIX", "s3://gp-creatives/binance/history")
+HISTORY_KEEP = 5
 LOCAL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "binance", "binance-prices.json")
 # Resolve the aws CLI from PATH so this runs on a CI runner as well as locally.
 AWS = os.environ.get("AWS_CLI") or shutil.which("aws") or "/opt/homebrew/bin/aws"
@@ -265,23 +269,58 @@ def build(quotes, source):
     }
 
 
+def _put_json(body, key, cache):
+    """Upload a JSON string gzipped, with the headers the creative expects."""
+    tmp = os.path.join(tempfile.mkdtemp(), os.path.basename(key))
+    with open(tmp, "wb") as f:
+        f.write(gzip.compress(body.encode(), 9))
+    subprocess.run(
+        [AWS, "s3", "cp", tmp, key,
+         "--content-type", "application/json",
+         "--content-encoding", "gzip",
+         "--cache-control", cache,
+         "--only-show-errors"],
+        check=True,
+    )
+    return os.path.getsize(tmp)
+
+
+def archive(doc):
+    """Write this run's feed to history/ and rebuild the rolling index.
+
+    Snapshots are immutable and never deleted: a year of hourly runs is ~3.4MB,
+    and that is a better trade than giving a scheduled job a delete path into a
+    bucket that also holds live creatives.
+
+    The index is built from an actual S3 listing rather than by assuming the
+    last N hour-stamps exist. Runs do get skipped (GitHub drops scheduled jobs
+    under load, and a validation failure publishes nothing), so computed stamps
+    would point at 404s and the portfolio would render blank phones.
+    """
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H")
+    body = json.dumps(doc, indent=2) + "\n"
+    n = _put_json(body, f"{HISTORY_PREFIX}/prices-{stamp}.json", "max-age=3600")
+    log(f"archived {n}B -> history/prices-{stamp}.json")
+
+    out = subprocess.run([AWS, "s3", "ls", HISTORY_PREFIX + "/"],
+                         capture_output=True, text=True, check=True)
+    stamps = sorted(
+        m for line in out.stdout.splitlines()
+        for m in [line.split()[-1]]
+        if m.startswith("prices-") and m.endswith(".json")
+    )
+    keep = [s[len("prices-"):-len(".json")] for s in stamps][-HISTORY_KEEP:]
+    _put_json(json.dumps(keep), f"{HISTORY_PREFIX}/index.json", "max-age=300")
+    log(f"index -> {len(keep)} snapshots ({keep[0]}..{keep[-1]})")
+
+
 def upload(doc):
     body = json.dumps(doc, indent=2) + "\n"
     if os.path.isdir(os.path.dirname(LOCAL)):
         with open(LOCAL, "w") as f:
             f.write(body)
-    tmp = os.path.join(tempfile.mkdtemp(), "binance-prices.json")
-    with open(tmp, "wb") as f:
-        f.write(gzip.compress(body.encode(), 9))
-    subprocess.run(
-        [AWS, "s3", "cp", tmp, S3_KEY,
-         "--content-type", "application/json",
-         "--content-encoding", "gzip",
-         "--cache-control", "max-age=60",
-         "--only-show-errors"],
-        check=True,
-    )
-    log(f"uploaded {os.path.getsize(tmp)}B gzipped -> {S3_KEY}")
+    n = _put_json(body, S3_KEY, "max-age=60")
+    log(f"uploaded {n}B gzipped -> {S3_KEY}")
 
 
 def main():
@@ -294,6 +333,13 @@ def main():
         log("dry run, not uploading")
         return
     upload(doc)
+    # Secondary. The live feed is what matters; a history failure must not
+    # fail the run or the next hour's publish.
+    if "--no-archive" not in sys.argv:
+        try:
+            archive(doc)
+        except Exception as e:
+            log(f"WARNING archive failed (feed still published): {type(e).__name__}: {e}")
     log("done")
 
 
