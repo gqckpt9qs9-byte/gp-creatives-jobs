@@ -11,7 +11,9 @@ creative fetches at render time.
 - **Sources, in priority order:**
   1. **CoinMarketCap** - keyed Pro endpoint, falling back to the keyless public
      endpoint. Queried by numeric coin id, never by symbol.
-  2. **Smadex xCrypto** - public CMC-derived hourly mirror.
+  2. **Smadex xCrypto** - public CMC-derived hourly mirror. The current
+     hour's file 404s until published, so the job walks back hour by hour to
+     the most recent one that exists.
   3. **Binance** - own ticker API, across `data-api.binance.vision`,
      `api.binance.com`, `api-gcp.binance.com`.
 - **Mapping:** CMC `price`/`percent_change_24h`, Smadex

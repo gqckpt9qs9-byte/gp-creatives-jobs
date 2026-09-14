@@ -25,7 +25,7 @@ import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 
 # Binance hosts, last resort in the source chain. All three serve identical
@@ -178,10 +178,16 @@ def fetch_smadex():
     date-only file as the fallback. Same field semantics as CMC (it is almost
     certainly CMC-derived), so usd_price_change_24h maps to change24h.
     """
+    # The current hour's file 404s until it is published, so walk back hour by
+    # hour to the most recent one that exists. Using timedelta rather than
+    # string maths so this stays correct across a day boundary. The date-only
+    # file is the last resort and is usually rejected by the staleness guard.
     now = datetime.now(timezone.utc)
-    day = now.strftime("%Y%m%d")
+    names = [f"{now - timedelta(hours=h):%Y%m%d%H}"
+             for h in range(0, int(MAX_SOURCE_AGE_H) + 1)]
+    names.append(f"{now:%Y%m%d}")
     last = None
-    for name in (f"{day}{now.strftime('%H')}", day):
+    for name in names:
         url = f"{SMADEX_URL}/creative-crypto-api-{name}.json"
         try:
             d, hdrs = _get(url)
