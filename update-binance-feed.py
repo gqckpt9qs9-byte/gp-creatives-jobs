@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-Regenerate s3://gp-creatives/binance/binance-prices.json from Binance's public
-24hr ticker API.
+Regenerate s3://gp-creatives/binance/binance-prices.json.
+
+Sources, in priority order: CoinMarketCap, the Smadex xCrypto mirror, then
+Binance's own ticker API.
 
 Safety model: this object is read by a live serving creative. The script only
 uploads if every coin passes validation. On any failure it exits non-zero and
@@ -24,8 +26,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
-# Failover order. All three serve identical public market data.
+# Binance hosts, last resort in the source chain. All three serve identical
+# public market data.
 #
 # data-api.binance.vision is deliberately first: Binance geo-blocks the main
 # api.binance.com and api-gcp.binance.com endpoints from US datacenter ranges
@@ -46,7 +50,8 @@ COINS = [
     ("ETHUSDT", "ETH", "Ethereum", 1027),
 ]
 
-# CoinMarketCap fallback. Used only if every Binance host fails.
+# CoinMarketCap: primary source. Richest fields (1h/7d/market cap) and
+# authoritative ranking.
 #
 # Two distinct endpoints, and they are not interchangeable:
 #   - Pro path takes the API key and REQUIRES it.
@@ -57,6 +62,10 @@ CMC_PRO_URL = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest
 CMC_PUBLIC_URL = "https://pro-api.coinmarketcap.com/public-api/v3/cryptocurrency/quotes/latest"
 CMC_KEY_FILE = os.path.expanduser("~/.cmc_key")
 
+# Smadex xCrypto feed: public, hourly, CMC-derived. Third-party infrastructure,
+# so it sits between CMC and Binance rather than first.
+SMADEX_URL = "https://static-content-1.smadex.com/cr84es/templ8s/xCrypto"
+
 S3_KEY = os.environ.get("FEED_S3_KEY", "s3://gp-creatives/binance/binance-prices.json")
 LOCAL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "binance", "binance-prices.json")
 # Resolve the aws CLI from PATH so this runs on a CI runner as well as locally.
@@ -66,6 +75,9 @@ TIMEOUT = 12
 # Validation bounds. Deliberately wide: these catch broken payloads
 # (nulls, zeros, a decimal-shift bug), not normal volatility.
 MAX_ABS_CHANGE_PCT = 60.0
+# Reject a static source file older than this. Guards against the Smadex
+# date-only fallback serving a ~24h-old snapshot with an inverted trend.
+MAX_SOURCE_AGE_H = 3.0
 SANITY = {"BTC": (1_000, 10_000_000), "ETH": (50, 500_000), "BNB": (10, 100_000)}
 
 
@@ -77,6 +89,18 @@ def _get(url, headers=None):
     req = urllib.request.Request(url, headers={"User-Agent": "kayzen-feed/1.0", **(headers or {})})
     with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
         return json.loads(r.read().decode()), r.headers
+
+
+def _age_hours(hdrs):
+    """Age of a static file from Last-Modified, or None for live APIs."""
+    lm = hdrs.get("Last-Modified")
+    if not lm:
+        return None
+    try:
+        return (datetime.now(timezone.utc)
+                - parsedate_to_datetime(lm)).total_seconds() / 3600.0
+    except Exception:
+        return None
 
 
 def fetch_binance():
@@ -147,17 +171,55 @@ def fetch_cmc():
     raise RuntimeError(f"coinmarketcap failed; last: {last}")
 
 
+def fetch_smadex():
+    """{display_symbol: (price, pct_change_24h)} from the Smadex xCrypto feed.
+
+    Public GCS-backed file regenerated hourly, named by UTC date + hour with a
+    date-only file as the fallback. Same field semantics as CMC (it is almost
+    certainly CMC-derived), so usd_price_change_24h maps to change24h.
+    """
+    now = datetime.now(timezone.utc)
+    day = now.strftime("%Y%m%d")
+    last = None
+    for name in (f"{day}{now.strftime('%H')}", day):
+        url = f"{SMADEX_URL}/creative-crypto-api-{name}.json"
+        try:
+            d, hdrs = _get(url)
+            # The payload carries no timestamp, so Last-Modified is the only
+            # staleness signal. The date-only file is a 00:15 UTC snapshot and
+            # can be ~24h old, which validation cannot catch because stale
+            # prices are still "sane" - it would just render the wrong
+            # direction. Reject anything older than the cutoff.
+            age = _age_hours(hdrs)
+            if age is not None and age > MAX_SOURCE_AGE_H:
+                raise ValueError(f"stale: {age:.1f}h old (cutoff {MAX_SOURCE_AGE_H}h)")
+            by = {r["symbol"]: r for r in d.get("data", [])}
+            out = {c[1]: (float(by[c[1]]["price"]), float(by[c[1]]["usd_price_change_24h"]))
+                   for c in COINS}
+            log(f"fetched from smadex ({name})")
+            return out, url
+        except Exception as e:
+            last = e
+            log(f"smadex {name} failed: {type(e).__name__}: {e}")
+    raise RuntimeError(f"smadex failed; last: {last}")
+
+
+# Source priority. CMC is authoritative and carries the richest fields; Smadex
+# is a public CMC-derived mirror; Binance is the exchange's own ticker and the
+# last resort because it geo-blocks (451) from US datacenter ranges.
+SOURCES = [("coinmarketcap", fetch_cmc), ("smadex", fetch_smadex), ("binance", fetch_binance)]
+
+
 def fetch():
-    """Try Binance, then CoinMarketCap. Returns (quotes, source)."""
-    try:
-        return fetch_binance()
-    except Exception as e:
-        log(f"primary source unavailable: {e}")
-        log("falling back to coinmarketcap")
-    try:
-        return fetch_cmc()
-    except Exception as e:
-        raise SystemExit(f"all sources failed; last: {e}")
+    """Try each source in priority order. Returns (quotes, source)."""
+    last = None
+    for name, fn in SOURCES:
+        try:
+            return fn()
+        except Exception as e:
+            last = e
+            log(f"source {name} unavailable: {e}")
+    raise SystemExit(f"all sources failed; last: {last}")
 
 
 def build(quotes, source):

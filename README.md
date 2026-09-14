@@ -8,9 +8,15 @@ Scheduled jobs for Kayzen HTML creative feeds hosted in `s3://gp-creatives/`.
 `s3://gp-creatives/binance/binance-prices.json`, which the live Binance ticker
 creative fetches at render time.
 
-- **Source:** Binance public 24hr ticker API, with failover across
-  `api.binance.com`, `api-gcp.binance.com`, `data-api.binance.vision`.
-- **Mapping:** `lastPrice` -> `price`, `priceChangePercent` -> `change24h`.
+- **Sources, in priority order:**
+  1. **CoinMarketCap** - keyed Pro endpoint, falling back to the keyless public
+     endpoint. Queried by numeric coin id, never by symbol.
+  2. **Smadex xCrypto** - public CMC-derived hourly mirror.
+  3. **Binance** - own ticker API, across `data-api.binance.vision`,
+     `api.binance.com`, `api-gcp.binance.com`.
+- **Mapping:** CMC `price`/`percent_change_24h`, Smadex
+  `price`/`usd_price_change_24h`, Binance `lastPrice`/`priceChangePercent`,
+  all normalised to `price`/`change24h`.
 - **Upload:** gzipped, `Content-Type: application/json`,
   `Content-Encoding: gzip`, `Cache-Control: max-age=60`.
 - **Schedule:** hourly (`0 * * * *`), plus manual `workflow_dispatch`.
@@ -22,6 +28,23 @@ anything it cannot validate. It uploads only if all three coins are present,
 each price falls inside a sane range, and `|change24h| <= 60%`. On any failure
 it exits non-zero and leaves the last good feed in place, so the ad shows
 stale-but-correct prices rather than zeros or a broken payload.
+
+A static source is also rejected if its `Last-Modified` is more than 3 hours
+old. This matters for Smadex: its hourly file 404s until published, and the
+date-only fallback is a 00:15 UTC snapshot that can be ~24h stale. Validation
+alone cannot catch that, because day-old prices are still "sane" - they would
+simply render the wrong direction (a red down-arrow during an up market).
+
+### Known source quirks
+
+- Binance returns **HTTP 451** for `api.binance.com` and `api-gcp.binance.com`
+  from US datacenter ranges, including GitHub Actions runners. Only
+  `data-api.binance.vision` answers there.
+- CMC's Pro and keyless endpoints are **not interchangeable**: the public path
+  rejects the API key header with a 401, and the two return different shapes
+  (`data` dict-by-id vs list, `quote` dict-by-currency vs list).
+- Querying CMC by **symbol** returns every token squatting the ticker (23 rows
+  for BNB,BTC,ETH, including a "Bitcoin AI" at $0.001). Always use numeric ids.
 
 ### Local use
 
