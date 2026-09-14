@@ -1,0 +1,51 @@
+name: Binance price feed
+
+# Refreshes s3://gp-creatives/binance/binance-prices.json, which the live
+# Binance ticker creative fetches at render time.
+#
+# GitHub's scheduler is best-effort: runs are queued and can drift several
+# minutes under load. That is acceptable here because the object is served
+# with Cache-Control: max-age=60 and the creative falls back to baked-in
+# defaults if the feed is ever unreachable.
+
+on:
+  schedule:
+    # Top of every hour (UTC).
+    - cron: "0 * * * *"
+  workflow_dispatch:
+
+# Never let two runs race on the same S3 object.
+concurrency:
+  group: binance-feed
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show resolved aws CLI
+        run: aws --version
+
+      - name: Refresh feed
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: us-east-1
+        run: python3 update-binance-feed.py
+
+      - name: Verify the live object round-trips
+        run: |
+          set -euo pipefail
+          URL=https://gp-creatives.s3.us-east-1.amazonaws.com/binance/binance-prices.json
+          echo "--- headers"
+          curl -sSD - -o /dev/null "$URL" \
+            | grep -iE '^(content-type|content-encoding|cache-control|last-modified)'
+          echo "--- body (gzip-inflated, as a browser sees it)"
+          curl -sS --compressed "$URL" \
+            | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['updated_at']); [print(f\"  {c['symbol']:<4} \${c['price']:>12,.2f}  {c['change24h']:+.2f}%\") for c in d['data']]"
