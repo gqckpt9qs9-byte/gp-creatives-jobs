@@ -34,12 +34,28 @@ from datetime import datetime, timezone
 # two stay as fallbacks because they do work from other networks.
 HOSTS = ["data-api.binance.vision", "api.binance.com", "api-gcp.binance.com"]
 
-# (binance symbol, display symbol, display name) in portfolio display order.
+# (binance symbol, display symbol, display name, coinmarketcap id) in display order.
+#
+# The CMC id is load-bearing: querying CMC by symbol returns every token
+# squatting that ticker (23 rows for BNB,BTC,ETH, including a "Bitcoin AI" at
+# $0.001), so a symbol match could render a scam token's price as Bitcoin.
+# Numeric ids are unambiguous.
 COINS = [
-    ("BNBUSDT", "BNB", "BNB"),
-    ("BTCUSDT", "BTC", "Bitcoin"),
-    ("ETHUSDT", "ETH", "Ethereum"),
+    ("BNBUSDT", "BNB", "BNB", 1839),
+    ("BTCUSDT", "BTC", "Bitcoin", 1),
+    ("ETHUSDT", "ETH", "Ethereum", 1027),
 ]
+
+# CoinMarketCap fallback. Used only if every Binance host fails.
+#
+# Two distinct endpoints, and they are not interchangeable:
+#   - Pro path takes the API key and REQUIRES it.
+#   - /public-api/ path is keyless and REJECTS the key header with a 401.
+# Sending the key to the public path is a 401, which looks exactly like a bad
+# key. Keep them separate.
+CMC_PRO_URL = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest"
+CMC_PUBLIC_URL = "https://pro-api.coinmarketcap.com/public-api/v3/cryptocurrency/quotes/latest"
+CMC_KEY_FILE = os.path.expanduser("~/.cmc_key")
 
 S3_KEY = os.environ.get("FEED_S3_KEY", "s3://gp-creatives/binance/binance-prices.json")
 LOCAL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "binance", "binance-prices.json")
@@ -57,39 +73,104 @@ def log(msg):
     print(f"[feed] {msg}", flush=True)
 
 
-def fetch():
-    """Return raw ticker rows, trying each host in turn."""
+def _get(url, headers=None):
+    req = urllib.request.Request(url, headers={"User-Agent": "kayzen-feed/1.0", **(headers or {})})
+    with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+        return json.loads(r.read().decode()), r.headers
+
+
+def fetch_binance():
+    """{display_symbol: (price, pct_change_24h)} from Binance, trying each host."""
     syms = json.dumps([c[0] for c in COINS], separators=(",", ":"))
     path = "/api/v3/ticker/24hr?symbols=" + urllib.parse.quote(syms)
     last = None
     for host in HOSTS:
-        url = f"https://{host}{path}"
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "kayzen-feed/1.0"})
-            with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
-                rows = json.loads(r.read().decode())
+            rows, hdrs = _get(f"https://{host}{path}")
             if not isinstance(rows, list) or len(rows) != len(COINS):
                 raise ValueError(f"expected {len(COINS)} rows, got {type(rows).__name__}")
-            log(f"fetched from {host} (weight-1m={r.headers.get('x-mbx-used-weight-1m','?')})")
-            return rows, host
+            by = {r["symbol"]: r for r in rows}
+            out = {c[1]: (float(by[c[0]]["lastPrice"]), float(by[c[0]]["priceChangePercent"]))
+                   for c in COINS}
+            log(f"fetched from {host} (weight-1m={hdrs.get('x-mbx-used-weight-1m','?')})")
+            return out, f"https://{host}/api/v3/ticker/24hr"
         except Exception as e:
             last = e
-            log(f"host {host} failed: {type(e).__name__}: {e}")
-    raise SystemExit(f"all hosts failed; last error: {last}")
+            log(f"binance {host} failed: {type(e).__name__}: {e}")
+    raise RuntimeError(f"all binance hosts failed; last: {last}")
 
 
-def build(rows, host):
-    by = {r.get("symbol"): r for r in rows}
+def _cmc_key():
+    k = os.environ.get("CMC_API_KEY", "").strip()
+    if not k and os.path.isfile(CMC_KEY_FILE):
+        k = open(CMC_KEY_FILE).read().strip()
+    # Ignore the placeholder so a half-finished setup falls through to keyless.
+    return "" if k.upper().startswith("YOUR") else k
+
+
+def fetch_cmc():
+    """{display_symbol: (price, pct_change_24h)} from CoinMarketCap.
+
+    Queries by numeric id, never by symbol: symbol lookup returns every token
+    squatting the ticker. Uses a key when one is available (private quota),
+    otherwise the keyless public tier (IP-pooled, so 429-prone on CI).
+    """
+    ids = ",".join(str(c[3]) for c in COINS)
+    qs = f"?id={ids}&convert=USD"
+    key = _cmc_key()
+    attempts = [("keyed", CMC_PRO_URL + qs, {"X-CMC_PRO_API_KEY": key})] if key else []
+    attempts.append(("keyless", CMC_PUBLIC_URL + qs, None))
+
+    last = None
+    for label, url, headers in attempts:
+        try:
+            d, _ = _get(url, headers)
+            if str(d.get("status", {}).get("error_code", "0")) not in ("0", "None"):
+                raise ValueError(d["status"].get("error_message", "cmc error"))
+            # Shape differs by endpoint: Pro v1 returns data as a dict keyed by
+            # id, public v3 returns a list. Likewise quote is a dict keyed by
+            # currency on Pro, a list on public. Normalise both.
+            raw = d.get("data", [])
+            rows = list(raw.values()) if isinstance(raw, dict) else raw
+            by = {}
+            for r in rows:
+                r = r[0] if isinstance(r, list) else r
+                q = r["quote"]
+                q = q[0] if isinstance(q, list) else q.get("USD", {})
+                by[int(r["id"])] = (float(q["price"]), float(q["percent_change_24h"]))
+            out = {c[1]: by[c[3]] for c in COINS}
+            log(f"fetched from coinmarketcap ({label})")
+            return out, f"{url.split(chr(63))[0]} ({label})"
+        except Exception as e:
+            last = e
+            log(f"coinmarketcap {label} failed: {type(e).__name__}: {e}")
+    raise RuntimeError(f"coinmarketcap failed; last: {last}")
+
+
+def fetch():
+    """Try Binance, then CoinMarketCap. Returns (quotes, source)."""
+    try:
+        return fetch_binance()
+    except Exception as e:
+        log(f"primary source unavailable: {e}")
+        log("falling back to coinmarketcap")
+    try:
+        return fetch_cmc()
+    except Exception as e:
+        raise SystemExit(f"all sources failed; last: {e}")
+
+
+def build(quotes, source):
     data, problems = [], []
-    for bsym, sym, name in COINS:
-        r = by.get(bsym)
-        if r is None:
+    for _bsym, sym, name, _cmcid in COINS:
+        q = quotes.get(sym)
+        if q is None:
             problems.append(f"{sym}: missing from response")
             continue
         try:
-            price = round(float(r["lastPrice"]), 2)
-            chg = round(float(r["priceChangePercent"]), 2)
-        except (KeyError, TypeError, ValueError) as e:
+            price = round(float(q[0]), 2)
+            chg = round(float(q[1]), 2)
+        except (TypeError, ValueError, IndexError) as e:
             problems.append(f"{sym}: unparseable ({e})")
             continue
         lo, hi = SANITY.get(sym, (0, float("inf")))
@@ -108,7 +189,7 @@ def build(rows, host):
         "study_id": "binance_ticker_202609",
         "advertiser": "Binance",
         "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "source": f"https://{host}/api/v3/ticker/24hr",
+        "source": source,
         "note": ("Price feed for the Binance ticker unit. Regenerated by "
                  "update-binance-feed.py; served gzipped on S3 "
                  "(Content-Encoding: gzip). Order = display order; unit renders first 3."),
@@ -137,8 +218,8 @@ def upload(doc):
 
 def main():
     dry = "--dry-run" in sys.argv
-    rows, host = fetch()
-    doc = build(rows, host)
+    quotes, source = fetch()
+    doc = build(quotes, source)
     for c in doc["data"]:
         log(f"  {c['symbol']:<4} ${c['price']:>12,.2f}  {c['change24h']:+.2f}%")
     if dry:
