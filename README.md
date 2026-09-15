@@ -8,14 +8,37 @@ Scheduled jobs for Kayzen HTML creative feeds hosted in `s3://gp-creatives/`.
 `s3://gp-creatives/binance/binance-prices.json`, which the live Binance ticker
 creative fetches at render time.
 
+### Feed schema (v2)
+
+`data[]` is the top 50 coins by market cap, each with `symbol`, `name`,
+`price`, `change24h`, `rank`, `cmc_id`, `icon`, `is_stable`. `display[]` names
+the three coins the unit renders, in order. `featured{}` explains any
+promotion.
+
+Selection policy lives in the job, not the unit, so it is testable and ships on
+the next hourly run without touching the creative:
+
+- `BNB` and `BTC` are pinned; `ETH` holds the flexible slot.
+- A non-anchor takes the flexible slot when it is up at least 5% over 24h and
+  beats ETH. Candidates must be top-50, not a stablecoin, inside the change cap,
+  and carry an icon (a promoted coin with no icon is a broken image in the ad).
+- Icons: anchors from the Kayzen CDN; everything else from CMC's deterministic
+  `https://s2.coinmarketcap.com/static/img/coins/64x64/{cmc_id}.png`.
+- Stablecoins are flagged via source `tags`, with a symbol backstop for sources
+  that carry none.
+
+The unit falls back to the first three rows if `display` is absent, so older
+snapshots still render.
+
 - **Sources, in priority order:**
   1. **CoinMarketCap** - keyed Pro endpoint, falling back to the keyless public
-     endpoint. Queried by numeric coin id, never by symbol.
+     endpoint. `listings/latest?limit=50`. Never query by symbol - it returns every token squatting a ticker.
   2. **Smadex xCrypto** - public CMC-derived hourly mirror. The current
      hour's file 404s until published, so the job walks back hour by hour to
      the most recent one that exists.
-  3. **Binance** - own ticker API, across `data-api.binance.vision`,
-     `api.binance.com`, `api-gcp.binance.com`.
+  3. **Binance** - own ticker API across `data-api.binance.vision`,
+     `api.binance.com`, `api-gcp.binance.com`. Cannot rank, so it fetches a
+     fixed universe of 20 well-known USDT pairs.
 - **Mapping:** CMC `price`/`percent_change_24h`, Smadex
   `price`/`usd_price_change_24h`, Binance `lastPrice`/`priceChangePercent`,
   all normalised to `price`/`change24h`.
