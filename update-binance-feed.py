@@ -37,9 +37,13 @@ from email.utils import parsedate_to_datetime
 
 # ---------------------------------------------------------------- policy ----
 
-# How many coins the feed carries. Gainer candidates come only from this set,
-# so it doubles as the market-cap floor that keeps micro-caps off the ad.
+# How many coins the feed carries: the TOP_N largest by market cap that are
+# tradable on Binance spot. CoinMarketCap is asked for FETCH_N so the cap is
+# still met after the Binance filter, which removes roughly a fifth of the
+# market-cap top 50. This is also the market-cap floor that keeps micro-caps
+# off the ad. CMC bills listings per 200 rows, so 100 costs the same as 50.
 TOP_N = 50
+FETCH_N = 100
 
 # Display order when nothing qualifies to displace an anchor.
 ANCHORS = ["BTC", "ETH", "BNB"]
@@ -153,7 +157,7 @@ def _cmc_key():
 
 def fetch_cmc():
     """Top N by market cap from CoinMarketCap. Pro (keyed) then public (keyless)."""
-    qs = f"?start=1&limit={TOP_N}&convert=USD"
+    qs = f"?start=1&limit={FETCH_N}&convert=USD"
     key = _cmc_key()
     attempts = [("keyed", CMC_PRO_LIST + qs, {"X-CMC_PRO_API_KEY": key})] if key else []
     attempts.append(("keyless", CMC_PUBLIC_LIST + qs, None))
@@ -299,7 +303,7 @@ def select_display(coins):
     # icon is a broken image on a live impression.
     candidates = sorted([c for c in coins
                          if c["symbol"] not in ANCHORS and not c["is_stable"] and c["icon"]
-                         and c["rank"] <= TOP_N and _ok(c) and c["change24h"] >= GAINER_MIN_PCT],
+                         and _ok(c) and c["change24h"] >= GAINER_MIN_PCT],
                         key=lambda c: -c["change24h"])
     for i in sorted(flexible, key=lambda i: by[display[i]]["change24h"]):
         if not candidates:
@@ -316,10 +320,13 @@ def select_display(coins):
 
 def build(coins, source, listed):
     # Only coins tradable on Binance reach the feed, so no unit can select one
-    # that the CTA cannot deliver. Ranks stay CoinMarketCap's, so "top 50" in
-    # the units' copy remains true.
-    not_listed = sorted(c["symbol"] for c in coins if c["symbol"] not in listed)
-    coins = [c for c in coins if c["symbol"] in listed]
+    # that the CTA cannot deliver; the feed is then the TOP_N largest of those.
+    # `rank` stays CoinMarketCap's overall rank, so it can exceed TOP_N, which
+    # is why the units say "top 50 on Binance". not_on_binance lists only the
+    # overall top 50 that were skipped, which is the meaningful list.
+    ranked = sorted(coins, key=lambda c: c["rank"])
+    not_listed = sorted(c["symbol"] for c in ranked if c["symbol"] not in listed and c["rank"] <= TOP_N)
+    coins = [c for c in ranked if c["symbol"] in listed][:TOP_N]
     if not_listed:
         log(f"excluded {len(not_listed)} not on Binance spot: {', '.join(not_listed)}")
     by = {c["symbol"]: c for c in coins}
