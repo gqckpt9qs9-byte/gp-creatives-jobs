@@ -18,8 +18,8 @@ promotion.
 Selection policy lives in the job, not the unit, so it is testable and ships on
 the next hourly run without touching the creative:
 
-- `BNB` and `BTC` are pinned; `ETH` holds the flexible slot.
-- A non-anchor takes the flexible slot when it is up at least 5% over 24h and
+- `BTC` is pinned; `ETH` and `BNB` are defaults that a gainer can displace.
+- A non-anchor takes a flexible slot (weakest anchor first) when it is up at least 5% over 24h and
   beats ETH. Candidates must be top-50, not a stablecoin, inside the change cap,
   and carry an icon (a promoted coin with no icon is a broken image in the ad).
 - Icons: anchors from the Kayzen CDN; everything else from CMC's deterministic

@@ -42,12 +42,14 @@ from email.utils import parsedate_to_datetime
 TOP_N = 50
 
 # Display order when nothing qualifies to displace an anchor.
-ANCHORS = ["BNB", "BTC", "ETH"]
-# Anchors that are never displaced. BNB is the advertiser's own coin; BTC is
-# the reference everyone recognises. ETH holds the flexible slot.
-PINNED = {"BNB", "BTC"}
-# A non-anchor must be up at least this much over 24h to take the flexible
-# slot, and must also beat the anchor it displaces.
+ANCHORS = ["BTC", "ETH", "BNB"]
+# Anchors that are never displaced. BTC is the reference everyone recognises.
+# ETH and BNB are defaults for quiet hours, not fixtures: over 481 hours of
+# history, pinning BNB as well kept a coin at a ~1% median move on screen while
+# a +5% gainer sat in the feed 92% of the time.
+PINNED = {"BTC"}
+# A non-anchor must be up at least this much over 24h to take a flexible slot,
+# and must also beat the anchor it displaces.
 GAINER_MIN_PCT = 5.0
 
 # Backstop for sources that carry no tags. CMC/Smadex tag stablecoins; Binance
@@ -248,32 +250,35 @@ def _ok(c):
 
 
 def select_display(coins):
-    """Anchors, with the flexible slot handed to a qualifying big gainer.
+    """Anchors, with each flexible slot handed to a qualifying big gainer.
 
-    Returns (display_symbols, featured) where featured maps a symbol to the
-    reason it was promoted, so the portfolio can explain what it is showing.
+    Flexible slots are filled weakest anchor first, and a gainer only takes a
+    slot if it beats the anchor already there, so on a quiet day ETH and BNB
+    simply stay. Returns (display_symbols, featured) where featured maps each
+    promoted symbol to the reason, so the portfolio can explain what it shows.
     """
     by = {c["symbol"]: c for c in coins}
     display = list(ANCHORS)
     featured = {}
-    flexible = [a for a in ANCHORS if a not in PINNED]
+    flexible = [i for i, a in enumerate(display) if a not in PINNED and a in by]
     if not flexible:
         return display, featured
-    slot = flexible[-1]
     # `icon` is required: a promoted coin renders in the ad, and a missing
     # icon is a broken image on a live impression.
-    candidates = [c for c in coins
-                  if c["symbol"] not in ANCHORS and not c["is_stable"] and c["icon"]
-                  and c["rank"] <= TOP_N and _ok(c) and c["change24h"] >= GAINER_MIN_PCT]
-    if not candidates:
-        return display, featured
-    best = max(candidates, key=lambda c: c["change24h"])
-    incumbent = by.get(slot)
-    if incumbent and best["change24h"] <= incumbent["change24h"]:
-        return display, featured
-    display[display.index(slot)] = best["symbol"]
-    featured[best["symbol"]] = {"reason": "top_gainer_24h", "replaced": slot,
-                                "change24h": round(best["change24h"], 2), "rank": best["rank"]}
+    candidates = sorted([c for c in coins
+                         if c["symbol"] not in ANCHORS and not c["is_stable"] and c["icon"]
+                         and c["rank"] <= TOP_N and _ok(c) and c["change24h"] >= GAINER_MIN_PCT],
+                        key=lambda c: -c["change24h"])
+    for i in sorted(flexible, key=lambda i: by[display[i]]["change24h"]):
+        if not candidates:
+            break
+        incumbent = by[display[i]]
+        if candidates[0]["change24h"] <= incumbent["change24h"]:
+            continue
+        best = candidates.pop(0)
+        featured[best["symbol"]] = {"reason": "top_gainer_24h", "replaced": display[i],
+                                    "change24h": round(best["change24h"], 2), "rank": best["rank"]}
+        display[i] = best["symbol"]
     return display, featured
 
 
@@ -312,7 +317,15 @@ def build(coins, source):
         raise SystemExit("refusing to publish; last good feed left in place")
 
     kept.sort(key=lambda c: c["rank"])
-    data = [{k: (round(v, 2) if isinstance(v, float) else v) for k, v in c.items()} for c in kept]
+    # Prices keep six significant figures; everything else rounds to 2dp.
+    # Rounding prices to 2dp published every sub-cent coin as 0.0 (PEPE, SHIB)
+    # and cost DOGE/ADA/XLM real precision, and selection runs before this
+    # line, so a coin could be promoted on its true price and shipped at $0.
+    def _round(k, v):
+        if not isinstance(v, float):
+            return v
+        return float(f"{v:.6g}") if k == "price" else round(v, 2)
+    data = [{k: _round(k, v) for k, v in c.items()} for c in kept]
     return {
         "schema": 2,
         "study_id": "binance_ticker_202609",
