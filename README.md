@@ -104,3 +104,7 @@ simply render the wrong direction (a red down-arrow during an up market).
 
 The key only needs `s3:PutObject` on
 `arn:aws:s3:::gp-creatives/binance/binance-prices.json`.
+
+## Binance listing filter
+
+Each run fetches the base assets trading on Binance spot (`/api/v3/exchangeInfo?permissions=SPOT` on data-api.binance.vision) and drops every coin not tradable there before selection, so no unit can feature a coin the CTA cannot deliver: competitor exchange tokens (OKB, CRO, LEO), delisted coins (XMR), tokenised gold (XAUt). Excluded symbols are published in `not_on_binance`. The last good list is cached at `s3://gp-creatives/binance/binance-listings.json`; if both the live check and the cache fail, the job refuses to publish and the previous feed stays.

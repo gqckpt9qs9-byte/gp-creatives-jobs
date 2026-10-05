@@ -94,6 +94,9 @@ BINANCE_UNIVERSE = [  # (symbol, name, cmc_id) - cmc_id only used for the icon U
 ]
 
 S3_KEY = os.environ.get("FEED_S3_KEY", "s3://gp-creatives/binance/binance-prices.json")
+# Last good Binance spot listing, used only if the live check fails.
+LISTINGS_KEY = os.environ.get("LISTINGS_S3_KEY", "s3://gp-creatives/binance/binance-listings.json")
+LISTINGS_URL = "https://gp-creatives.s3.us-east-1.amazonaws.com/binance/binance-listings.json"
 HISTORY_PREFIX = os.environ.get("FEED_HISTORY_PREFIX", "s3://gp-creatives/binance/history")
 HISTORY_KEEP = 5
 LOCAL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "binance", "binance-prices.json")
@@ -242,6 +245,35 @@ def fetch():
     raise SystemExit(f"all sources failed; last: {last}")
 
 
+def binance_listed():
+    """Base assets currently trading on Binance spot, plus a fresh cache record.
+
+    The ad's CTA is "Download now" for Binance, so it must never feature a coin
+    that cannot be bought there. The top 50 routinely contains competitor
+    exchange tokens (OKB, CRO, LEO), coins Binance has delisted (XMR) and
+    tokenised gold (XAUt). Checked live each run; on failure the last good list
+    cached on S3 is used; with neither, the job refuses to publish.
+    """
+    for host in BINANCE_HOSTS:
+        try:
+            d, _ = _get(f"https://{host}/api/v3/exchangeInfo?permissions=SPOT")
+            assets = sorted({x["baseAsset"] for x in d["symbols"] if x["status"] == "TRADING"})
+            if len(assets) < 100:
+                raise ValueError(f"only {len(assets)} assets")
+            log(f"binance listings: {len(assets)} spot assets trading ({host})")
+            return set(assets), {"assets": assets, "source": host,
+                                 "fetched_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+        except Exception as e:
+            log(f"binance listings {host} failed: {type(e).__name__}: {e}")
+    try:
+        raw = urllib.request.urlopen(LISTINGS_URL, timeout=TIMEOUT).read()
+        cached = json.loads(gzip.decompress(raw) if raw[:2] == b"\x1f\x8b" else raw)
+        log(f"binance listings: live check failed, using cache from {cached.get('fetched_at')}")
+        return set(cached["assets"]), None
+    except Exception as e:
+        raise SystemExit(f"cannot establish Binance listings live or from cache ({e}); refusing to publish")
+
+
 # -------------------------------------------------------- select + build ----
 
 def _ok(c):
@@ -282,7 +314,14 @@ def select_display(coins):
     return display, featured
 
 
-def build(coins, source):
+def build(coins, source, listed):
+    # Only coins tradable on Binance reach the feed, so no unit can select one
+    # that the CTA cannot deliver. Ranks stay CoinMarketCap's, so "top 50" in
+    # the units' copy remains true.
+    not_listed = sorted(c["symbol"] for c in coins if c["symbol"] not in listed)
+    coins = [c for c in coins if c["symbol"] in listed]
+    if not_listed:
+        log(f"excluded {len(not_listed)} not on Binance spot: {', '.join(not_listed)}")
     by = {c["symbol"]: c for c in coins}
     problems = []
 
@@ -337,6 +376,7 @@ def build(coins, source):
                  "from. Regenerated hourly by update-binance-feed.py; served gzipped."),
         "display": display,
         "featured": featured,
+        "not_on_binance": not_listed,
         "data": data,
     }
 
@@ -379,7 +419,8 @@ def upload(doc):
 def main():
     dry = "--dry-run" in sys.argv
     coins, source = fetch()
-    doc = build(coins, source)
+    listed, fresh = binance_listed()
+    doc = build(coins, source, listed)
     by = {c["symbol"]: c for c in doc["data"]}
     for s in doc["display"]:
         c = by[s]
@@ -390,6 +431,11 @@ def main():
         log("dry run, not uploading")
         return
     upload(doc)
+    if fresh:
+        try:
+            _put_json(json.dumps(fresh), LISTINGS_KEY, "max-age=3600")
+        except Exception as e:
+            log(f"WARNING listings cache not written (feed still published): {type(e).__name__}: {e}")
     if "--no-archive" not in sys.argv:
         try:
             archive(doc)
