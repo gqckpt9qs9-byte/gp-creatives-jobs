@@ -21,11 +21,14 @@ Usage:
   ./update-binance-feed.py --no-archive  # publish the feed but skip history/
 """
 
+import csv
 import gzip
+import io
 import json
 import math
 import os
 import shutil
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -103,6 +106,14 @@ LISTINGS_KEY = os.environ.get("LISTINGS_S3_KEY", "s3://gp-creatives/binance/bina
 LISTINGS_URL = "https://gp-creatives.s3.us-east-1.amazonaws.com/binance/binance-listings.json"
 HISTORY_PREFIX = os.environ.get("FEED_HISTORY_PREFIX", "s3://gp-creatives/binance/history")
 HISTORY_KEEP = 5
+# One row per run: market summary plus the mode each unit renders in. This is
+# what analysis joins events to (latest published_at at or before the event),
+# and what the feed portfolio page charts. Regenerable from history/ with
+# rebuild-states.py.
+STATES_KEY = os.environ.get("FEED_STATES_KEY", HISTORY_PREFIX + "/states.csv")
+STATES_COLS = ["published_at", "hour", "source", "display", "basket_avg", "btc_change",
+               "median_change", "risers", "coins", "top_gainer", "top_gainer_change",
+               "invested", "champ", "movers", "scratch", "vote"]
 LOCAL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "binance", "binance-prices.json")
 AWS = os.environ.get("AWS_CLI") or shutil.which("aws") or "/opt/homebrew/bin/aws"
 TIMEOUT = 12
@@ -372,7 +383,7 @@ def build(coins, source, listed):
             return v
         return float(f"{v:.6g}") if k == "price" else round(v, 2)
     data = [{k: _round(k, v) for k, v in c.items()} for c in kept]
-    return {
+    doc = {
         "schema": 2,
         "study_id": "binance_ticker_202609",
         "advertiser": "Binance",
@@ -386,6 +397,93 @@ def build(coins, source, listed):
         "not_on_binance": not_listed,
         "data": data,
     }
+    doc["state"] = unit_states(doc)
+    return doc
+
+
+# ------------------------------------------------------------ unit state ----
+
+def unit_states(doc):
+    """Market summary and the mode each unit renders in for this feed.
+
+    Mirrors the rules in binance/concepts/0[1-6]-*.html and must change with
+    them: Invested and Champ go neutral when the three display coins sum below
+    zero, Movers when fewer than three coins rose, Scratch when none rose, and
+    Vote says "held up best" when even its best tile fell.
+    """
+    data = doc.get("data", [])
+    by = {c["symbol"]: c for c in data}
+    movable = [c for c in data if not c.get("is_stable", c["symbol"] in STABLE_SYMBOLS)
+               and c.get("change24h") is not None]
+    disp = [by[x] for x in doc.get("display", []) if x in by][:3]
+    if len(disp) < 3:
+        disp = movable[:3]
+    basket = sum(c["change24h"] for c in disp)
+    ranked = sorted(movable, key=lambda c: -c["change24h"])
+    risers = sum(1 for c in movable if c["change24h"] > 0)
+    top = ranked[0] if ranked else None
+    four = disp + [c for c in ranked[:4] if c not in disp][:1]
+    best = max((c["change24h"] for c in four), default=0)
+    return {
+        "basket_avg": round(basket / len(disp), 2) if disp else None,
+        "btc_change": by.get("BTC", {}).get("change24h"),
+        "median_change": round(statistics.median(c["change24h"] for c in movable), 2) if movable else None,
+        "risers": risers,
+        "coins": len(movable),
+        "top_gainer": top["symbol"] if top else "",
+        "top_gainer_change": top["change24h"] if top else None,
+        "invested": "returns" if basket >= 0 else "buys",
+        "champ": "full" if basket >= 0 else "prices_only",
+        "movers": "gainers" if risers >= 3 else "prices",
+        "scratch": "gainer" if top and top["change24h"] > 0 else "btc_price",
+        "vote": "leading" if best >= 0 else "held_up_best",
+    }
+
+
+def state_row(doc, hour):
+    st = doc.get("state") or unit_states(doc)
+    src = str(doc.get("source", ""))
+    return {"published_at": doc.get("updated_at", ""), "hour": hour,
+            "source": "coinmarketcap" if "coinmarketcap" in src else "smadex" if "smadex" in src
+                      else "binance" if "binance" in src else src[:20],
+            "display": "|".join(doc.get("display", [])), **st}
+
+
+def states_csv(rows):
+    out = io.StringIO()
+    w = csv.DictWriter(out, fieldnames=STATES_COLS, extrasaction="ignore", lineterminator="\n")
+    w.writeheader()
+    for r in sorted(rows, key=lambda r: r["published_at"]):
+        w.writerow(r)
+    return out.getvalue()
+
+
+def _put_text(body, key, ctype, cache):
+    tmp = os.path.join(tempfile.mkdtemp(), os.path.basename(key))
+    with open(tmp, "w") as f:
+        f.write(body)
+    subprocess.run([AWS, "s3", "cp", tmp, key, "--content-type", ctype, "--cache-control", cache,
+                    "--only-show-errors"], check=True)
+
+
+def append_state(doc, hour):
+    """Add this run's row to states.csv. S3 cannot append, so read and rewrite.
+
+    If the existing file cannot be read, skip rather than write a fresh one:
+    a one-row file would silently replace the whole history. A skipped row is
+    recoverable with rebuild-states.py; an overwrite is not.
+    """
+    got = subprocess.run([AWS, "s3", "cp", STATES_KEY, "-"], capture_output=True, text=True)
+    if got.returncode != 0:
+        log(f"WARNING states.csv not readable, row skipped (run rebuild-states.py): {got.stderr.strip()[:160]}")
+        return
+    rows = list(csv.DictReader(io.StringIO(got.stdout)))
+    row = state_row(doc, hour)
+    if any(r.get("published_at") == row["published_at"] for r in rows):
+        return
+    rows.append(row)
+    _put_text(states_csv(rows), STATES_KEY, "text/csv; charset=utf-8", "max-age=300")
+    log(f"states.csv -> {len(rows)} rows ({row['invested']}/{row['movers']}/{row['scratch']}, risers {row['risers']})")
 
 
 # ------------------------------------------------------------- publish ----
@@ -448,6 +546,10 @@ def main():
             archive(doc)
         except Exception as e:
             log(f"WARNING archive failed (feed still published): {type(e).__name__}: {e}")
+        try:
+            append_state(doc, datetime.now(timezone.utc).strftime("%Y%m%d%H"))
+        except Exception as e:
+            log(f"WARNING states.csv not updated (feed still published): {type(e).__name__}: {e}")
     log("done")
 
 

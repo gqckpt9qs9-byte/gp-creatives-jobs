@@ -108,3 +108,7 @@ The key only needs `s3:PutObject` on
 ## Binance listing filter
 
 Each run fetches the base assets trading on Binance spot (`/api/v3/exchangeInfo?permissions=SPOT` on data-api.binance.vision) and drops every coin not tradable there before selection, then keeps the 50 largest that remain (CoinMarketCap is asked for 100 so the cap is still met), so no unit can feature a coin the CTA cannot deliver: competitor exchange tokens (OKB, CRO, LEO), delisted coins (XMR), tokenised gold (XAUt). Excluded symbols are published in `not_on_binance`. The last good list is cached at `s3://gp-creatives/binance/binance-listings.json`; if both the live check and the cache fail, the job refuses to publish and the previous feed stays.
+
+## Unit state and states.csv
+
+Each feed carries a `state` block: a market summary plus the mode each unit renders in (`invested`: returns/buys, `champ`: full/prices_only, `movers`: gainers/prices, `scratch`: gainer/btc_price, `vote`: leading/held_up_best). The rules mirror the units and must change with them. Every run also adds a row to `s3://gp-creatives/binance/history/states.csv`; join in-ad events to it on the latest `published_at` at or before the event time. If the CSV cannot be read the job skips the row rather than overwrite history. `rebuild-states.py` regenerates the whole file from history/ (backfill, recovery, or after a rule change).
